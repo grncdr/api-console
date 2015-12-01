@@ -1,6 +1,14 @@
 module Console (Model, main) where
+{-| The console let's you type stuff, and it suggests completions based on a
+supplied [`Matcher`](Matcher.elm). It doesn't execute any actions yet because
+I'm super lazy.
+-}
 
 import Debug
+import Dict
+import Json.Decode exposing (customDecoder)
+import Keyboard
+import Maybe exposing (andThen, withDefault)
 import StartApp
 import Effects
 
@@ -8,7 +16,7 @@ import Html exposing (..)
 import Html.Events exposing (..)
 import Html.Attributes exposing (id, type', for, value, class)
 
-import Matcher exposing (Matcher, Match, MatchPart(..))
+import Matcher exposing (MatchPart(..))
 import Contentful.Data exposing (FieldType(..))
 import Contentful.Routes as Routes
 
@@ -16,21 +24,29 @@ type Action =
   NewInput String
   | SelectNextMatch
   | SelectPreviousMatch
-  | UseSelectedMatch
+  | UseSelected Matcher.Match
   | SendRequest
+  | ShiftModifier Bool
+  | MetaModifier Bool
   | DoNothing
 
 type alias Model =
   { input : String
+  , shift : Bool
+  , meta : Bool
   , matcher : Matcher.Matcher
-  , matches : List Match
-  , selectedMatch : Maybe Match
+  , matches : List Matcher.Match
+  , selectedIndex : Maybe Int
+  , history : List { input: String }
   }
 
 emptyModel : Model
 emptyModel = { input = ""
+             , shift = False
+             , meta = False
              , matches = []
-             , selectedMatch = Nothing
+             , selectedIndex = Nothing
+             , history = []
              , matcher = Routes.deliveryAPI [ { id = "post"
                                               , fields = [ { id = "title" , type' = Symbol }
                                                          , { id = "body", type' = Text }
@@ -45,96 +61,120 @@ emptyModel = { input = ""
              }
 
 update action model =
+  let matchCount = List.length model.matches
+      selectNext = defaultMap -1 (nextIndex 1 matchCount)
+      selectPrevious = defaultMap 0 (nextIndex -1 matchCount)
+  in
   case action of
+    ShiftModifier bool ->
+      ( { model | shift = bool }, Effects.none )
+    MetaModifier bool ->
+      ( { model | meta = bool }, Effects.none )
     NewInput str ->
       let
           matches = model.matcher { matched = [], unmatched = str, stop = False }
           _ = Debug.watch "Matches" (List.map (\m -> m.matched) matches)
       in
-        ( { model | input = str, matches = matches, selectedMatch = Nothing }, Effects.none )
+        ( { model | input = str, matches = matches, selectedIndex = Nothing }, Effects.none )
     SelectNextMatch ->
-      ( { model | selectedMatch = selectNextMatch model.selectedMatch model.matches }, Effects.none )
+      ( { model | selectedIndex = Just <| selectNext model.selectedIndex }, Effects.none )
     SelectPreviousMatch ->
-      ( { model | selectedMatch = selectPreviousMatch model.selectedMatch model.matches }, Effects.none )
-    UseSelectedMatch ->
+      ( { model | selectedIndex = Just <| selectPrevious model.selectedIndex }, Effects.none )
+    UseSelected match ->
       let
-          model' = case model.selectedMatch of
-            Nothing ->
-              model
-            Just m ->
-              let
-                  str = Matcher.matchString m
-              in
-                 { model
-                 | input = str
-                 , selectedMatch = Nothing
-                 , matches = model.matcher { unmatched = str, matched = [], stop = False }
-                 }
+          str = Matcher.matchString match
       in
-         ( model', Effects.none )
+         ( { model
+           | input = str
+           , selectedIndex = Nothing
+           , matches = model.matcher { unmatched = str, matched = [], stop = False }
+           }
+         , Effects.none
+         )
+    SendRequest ->
+      ( { model
+        | history = model.history ++ [{ input = model.input }]
+        , input = ""
+        , matches = []
+        , selectedIndex = Nothing
+        }
+      , Effects.none
+      )
     _ ->
       ( model, Effects.none )
 
-selectNextMatch current matches =
-  case current of
-    Nothing -> List.head matches
-    Just m ->
-      let
-          next l =
-            case l of
-              [] -> Nothing
-              (m' :: ms) -> if m' == m then
-                               if List.isEmpty ms then
-                                  List.head matches
-                               else
-                                  List.head ms
-                            else
-                              next ms
-          selectedMatch = next matches
-      in
-         next matches
 
-selectPreviousMatch current matches =
-  selectNextMatch current (List.reverse matches)
+defaultMap : a -> (a -> b) -> Maybe a -> b
+defaultMap d f m =
+  case m of
+    Nothing -> f d
+    Just x -> f x
+
+nextIndex step len i = (i + step) % len
+
+boundedIndex i len =
+  if i < 0 then len + i else if i > len then i - len else i
+
+nth n list =
+  if n == 0
+     then List.head list
+     else nth (n - 1) list
 
 view self model =
-  div
-    []
-    [ replInput self model.input
-    , viewMatches model.selectedMatch model.matches
-    ]
+  let selectedIndex = case model.selectedIndex of
+        Nothing -> -1
+        Just i -> i
+      
+      keyCodeToAction code =
+        case code of
+          9  ->                     -- Tab
+            if model.shift then Ok SelectPreviousMatch else Ok SelectNextMatch
+          40 -> Ok SelectNextMatch     -- Down Arrow
+          38 -> Ok SelectPreviousMatch -- Up Arrow
+          13 ->
+            case model.selectedIndex of
+              Nothing -> Ok SendRequest
+              Just i -> 
+                case nth i model.matches of
+                  Nothing -> Err "selection is invalid"
+                  Just m -> Ok (UseSelected m)
+          _ -> Err "not handling that key"
+  in
+    div
+      []
+      [ viewHistory model.history
+      , replInput self model.input keyCodeToAction
+      , viewMatches selectedIndex model.matches
+      ]
 
-replInput self val =
-  input [ type' "text"
-        , value val
-        , on "input" targetValue (\str -> Signal.message self (NewInput str))
-        , onWithOptions
-            "keyup"
-            { stopPropagation = True, preventDefault = True }
-            keyCode
-            (codeToAction self)
-        , Html.Attributes.style [("width", "100%"), ("font-size", "20px")]
-        ]
-        []
+viewHistory log =
+  ul [] (List.map (\it -> li [] [ text it.input ]) log)
 
-codeToAction self code =
-  Signal.message self (if code == 38 then SelectPreviousMatch
-                       else if code == 40 then SelectNextMatch
-                       else if code == 13 then UseSelectedMatch
-                       else DoNothing)
+replInput self val keyCodeToAction =
+  let
+      actionKeys = customDecoder keyCode keyCodeToAction
+      dropEvent = { stopPropagation = True, preventDefault = True }
+  in
+    input [ type' "text"
+          , value val
+          , on "input" targetValue (\str -> Signal.message self (NewInput str))
+          , onWithOptions "keydown" dropEvent actionKeys (Signal.message self)
+          , onWithOptions "keyup" dropEvent actionKeys (\_ -> Signal.message self DoNothing)
+          , Html.Attributes.style [("width", "100%"), ("font-size", "20px")]
+          ]
+          []
 
-viewMatches selectedMatch matches =
-  ul [] (List.map (\m -> viewMatch selectedMatch m) matches)
+dropKeydown self code = Signal.message self DoNothing
 
-viewMatch selectedMatch match =
+viewMatches selectedIndex matches =
+  div [] (List.indexedMap (\i m -> viewMatch m (i == selectedIndex)) matches)
+
+viewMatch match isSelected =
   let
     spans = List.map viewMatchPart match.matched
-    styles = case selectedMatch of
-      Nothing -> []
-      Just selection ->
-        if selection == match then [("background-color", "#fafada")] else []
+    styles = [("padding", "5px")] ++ if isSelected then [("background-color", "#fafada")] else []
   in
-     li [ Html.Attributes.style styles ] spans
+     div [ Html.Attributes.style styles ] spans
 
 viewMatchPart part =
   case part of
@@ -146,7 +186,8 @@ app =
       { init = (emptyModel, Effects.none)
       , update = update
       , view = view
-      , inputs = []
+      , inputs = [ Signal.map ShiftModifier Keyboard.shift
+                 , Signal.map MetaModifier Keyboard.meta]
       }
 
 main = app.html
