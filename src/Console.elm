@@ -26,8 +26,8 @@ type Action =
   | SelectPreviousMatch
   | UseSelected Matcher.Match
   | SendRequest
-  | ShiftModifier Bool
-  | MetaModifier Bool
+  | ShiftState Bool
+  | MetaState Bool
   | DoNothing
 
 type alias Model =
@@ -66,9 +66,9 @@ update action model =
       selectPrevious = defaultMap 0 (nextIndex -1 matchCount)
   in
   case action of
-    ShiftModifier bool ->
+    ShiftState bool ->
       ( { model | shift = bool }, Effects.none )
-    MetaModifier bool ->
+    MetaState bool ->
       ( { model | meta = bool }, Effects.none )
     NewInput str ->
       let
@@ -186,8 +186,9 @@ app =
       { init = (emptyModel, Effects.none)
       , update = update
       , view = view
-      , inputs = [ Signal.map ShiftModifier Keyboard.shift
-                 , Signal.map MetaModifier Keyboard.meta]
+      , inputs = [ Signal.map ShiftState Keyboard.shift
+                 , Signal.map MetaState Keyboard.meta
+                 ]
       }
 
 main = app.html
