@@ -1,0 +1,9 @@
+[submodule "elm-localstorage.git"]
+	path = elm-localstorage.git
+	url = git@github.com:xdissent/elm-localstorage.git
+[submodule "elm-localstorage"]
+	path = vendor/elm-localstorage
+	url = git@github.com:xdissent/elm-localstorage.git
+[submodule "elm-history"]
+	path = elm-history
+	url = git@github.com:TheSeamau5/elm-history.git
