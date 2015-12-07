@@ -1,4 +1,4 @@
-module Contentful.Decode (array, contentType) where
+module Contentful.Decode (array, space, contentType, apiKey) where
 
 import Contentful.Data exposing (..)
 import Dict
@@ -32,7 +32,7 @@ sysId = at ["sys", "id"] string
 field : Decoder Field
 field = customDecoder value (\v ->
   let 
-      id = decodeValue sysId v
+      id = decodeValue ("id" := string) v
       stype = decodeValue ("type" := string) v
       atype = decodeValue (maybe (at ["items", "type"] string)) v
 
@@ -45,6 +45,15 @@ field = customDecoder value (\v ->
      Result.andThen triple construct)
 
 
+array : Decoder a -> Decoder (List a)
+array f =
+  "items" := list f
+
+space : Decoder Space
+space =
+  let construct id name = { name = name, id = id }
+  in object2 construct sysId ("name" := string)
+
 contentType : Decoder ContentType
 contentType =
   let
@@ -52,6 +61,7 @@ contentType =
   in
       object2 construct sysId ("fields" := list field)
 
-array : Decoder a -> Decoder (List a)
-array f =
-  "items" := list f
+apiKey : Decoder ApiKey
+apiKey =
+  let construct id name token = { name = name, id = id, token = token }
+  in object3 construct sysId ("name" := string) ("accessToken" := string)

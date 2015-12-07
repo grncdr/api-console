@@ -1,194 +1,280 @@
-module Console (Model, main) where
-{-| The console let's you type stuff, and it suggests completions based on a
-supplied [`Matcher`](Matcher.elm). It doesn't execute any actions yet because
-I'm super lazy.
+module Console (Model, Action(ShiftState, MetaState), init, update, view) where
+{-| You type stuff in the console, and it suggests completions based on the
+supplied [`Matcher`](Matcher.elm).
 -}
 
+{-
+TODO:
+ - Refactor history into 2 separate histories
+   1. a history of executions (what currently lives here)
+   2. a history of inputs (which can be edited like bash does) this can be
+      encapsulated in a new ConsoleInput component that handles up/down itself
+-}
 import Debug
+
+import Array exposing (Array)
 import Dict
 import Json.Decode exposing (customDecoder)
-import Keyboard
-import Maybe exposing (andThen, withDefault)
+import Json.Encode
+import Task exposing (Task, andThen)
 import StartApp
-import Effects
+import Effects exposing (Effects)
 
 import Html exposing (..)
 import Html.Events exposing (..)
-import Html.Attributes exposing (id, type', for, value, class)
+import Html.Attributes exposing (id, type', for, value, class, style)
 
+import ListHelpers exposing (..)
 import Matcher exposing (MatchPart(..))
-import Contentful.Data exposing (FieldType(..))
-import Contentful.Routes as Routes
 
-type Action =
+import Styles
+
+---- MODEL ----
+
+type Direction = Down | Up
+
+type Action var result =
   NewInput String
-  | SelectNextMatch
-  | SelectPreviousMatch
-  | UseSelected Matcher.Match
-  | SendRequest
+  | MoveHighlight Direction
+  | MoveHistory Direction
+  | SelectMatch (Matcher.Match var)
+  | Execute
+  | RecordResult Int result
   | ShiftState Bool
   | MetaState Bool
   | DoNothing
 
-type alias Model =
+type alias Model var result =
   { input : String
-  , shift : Bool
-  , meta : Bool
-  , matcher : Matcher.Matcher
-  , matches : List Matcher.Match
-  , selectedIndex : Maybe Int
-  , history : List { input: String }
+  , shiftKey : Bool
+  , metaKey : Bool
+  , runMatcher : String -> List (Matcher.Match var)
+  , matches : List (Matcher.Match var)
+  , exec : Executor var result
+  , resultHtml : (result -> Html)
+  , highlightedMatch : Maybe (Matcher.Match var)
+  , historyPosition : Int
+  , history : Array.Array (Execution var result)
   }
 
-emptyModel : Model
-emptyModel = { input = ""
-             , shift = False
-             , meta = False
-             , matches = []
-             , selectedIndex = Nothing
-             , history = []
-             , matcher = Routes.deliveryAPI [ { id = "post"
-                                              , fields = [ { id = "title" , type' = Symbol }
-                                                         , { id = "body", type' = Text }
-                                                         ]
-                                              }
-                                            , { id = "gallery"
-                                              , fields = [ { id = "name" , type' = Symbol }
-                                                         , { id = "blahblah", type' = Text }
-                                                         ]
-                                              }
-                                            ]
-             }
+{-| An Executor is a user-supplied function of input & variables to a result
+-}
+type alias Executor var result = String -> List var -> Task Effects.Never result
 
+{-| An execution represents a submitted command
+-}
+type Execution var result = Pending String (List var) | Completed String (List var) result
+
+---- INIT ----
+
+init : Matcher.Matcher var -> Executor var result -> (result -> Html) -> Model var result
+init matcher exec resultHtml =
+  { input = ""
+  , shiftKey = False
+  , metaKey = False
+  , matches = []
+  , highlightedMatch = Nothing
+  , history = Array.empty
+  , historyPosition = 0
+  , runMatcher = Matcher.run matcher
+  , exec = exec
+  , resultHtml = resultHtml
+  }
+
+---- UPDATE ----
+
+update : Action var result -> Model var result -> (Model var result, Effects (Action var result))
 update action model =
-  let matchCount = List.length model.matches
-      selectNext = defaultMap -1 (nextIndex 1 matchCount)
-      selectPrevious = defaultMap 0 (nextIndex -1 matchCount)
-  in
   case action of
     ShiftState bool ->
-      ( { model | shift = bool }, Effects.none )
+      ( { model | shiftKey = bool }, Effects.none )
     MetaState bool ->
-      ( { model | meta = bool }, Effects.none )
+      ( { model | metaKey = bool }, Effects.none )
     NewInput str ->
       let
-          matches = model.matcher { matched = [], unmatched = str, stop = False }
-          _ = Debug.watch "Matches" (List.map (\m -> m.matched) matches)
+        matches = model.runMatcher str
+        highlightedMatch = (
+          Maybe.map Matcher.matchBindings model.highlightedMatch
+          |> Maybe.map (\bindings -> List.filter (Matcher.matchBindings >> (==) bindings) matches)
+        ) `Maybe.andThen` List.head
       in
-        ( { model | input = str, matches = matches, selectedIndex = Nothing }, Effects.none )
-    SelectNextMatch ->
-      ( { model | selectedIndex = Just <| selectNext model.selectedIndex }, Effects.none )
-    SelectPreviousMatch ->
-      ( { model | selectedIndex = Just <| selectPrevious model.selectedIndex }, Effects.none )
-    UseSelected match ->
+        ( { model
+          | input = str
+          , matches = matches
+          , highlightedMatch = highlightedMatch
+          }
+        , Effects.none )
+    MoveHighlight direction ->
       let
-          str = Matcher.matchString match
+        f = case direction of
+          Down -> following
+          Up -> preceding
       in
-         ( { model
-           | input = str
-           , selectedIndex = Nothing
-           , matches = model.matcher { unmatched = str, matched = [], stop = False }
-           }
-         , Effects.none
-         )
-    SendRequest ->
-      ( { model
-        | history = model.history ++ [{ input = model.input }]
-        , input = ""
-        , matches = []
-        , selectedIndex = Nothing
-        }
-      , Effects.none
-      )
+        ( { model | highlightedMatch = f model.highlightedMatch model.matches }, Effects.none )
+    MoveHistory direction ->
+      let
+        i = case direction of
+          Down -> model.historyPosition + 1
+          Up -> model.historyPosition - 1
+        i' = if i < 0
+                then 0
+                else if i > (Array.length model.history)
+                        then Array.length model.history
+                        else i
+        model' = { model | historyPosition = i' }
+        matches = Debug.watch "matching" (getCurrentInput model') |> model'.runMatcher
+      in
+        ( { model' | matches = matches }, Effects.none )
+    SelectMatch match ->
+      let
+        str = Matcher.matchString match
+      in
+        ( { model | input = str
+                  , highlightedMatch = Nothing
+                  , matches = model.runMatcher str }
+        , Effects.none
+        )
+    Execute ->
+      let
+          variables = List.head model.matches
+            |> Maybe.map (Matcher.matchBindings)
+            |> Maybe.withDefault []
+          idx = Array.length model.history
+          execution = Pending (getCurrentInput model) variables
+          history = Array.push execution model.history
+          line = getCurrentInput model
+          task = model.exec line variables |> Task.map (RecordResult idx)
+      in
+        ( { model
+          | history = history
+          , historyPosition = idx + 1
+          , input = "" 
+          , matches = []
+          , highlightedMatch = Nothing
+          }
+        , Effects.task task
+        )
+    RecordResult idx result ->
+      let
+          history = model.history
+          newModel = case Array.get idx history of
+            Just (Pending input vars) ->
+              { model | history = Array.set idx (Completed input vars result) history }
+            _ -> model
+      in
+         (newModel, Effects.none)
     _ ->
       ( model, Effects.none )
 
 
-defaultMap : a -> (a -> b) -> Maybe a -> b
-defaultMap d f m =
-  case m of
-    Nothing -> f d
-    Just x -> f x
+---- VIEW ----
 
-nextIndex step len i = (i + step) % len
-
-boundedIndex i len =
-  if i < 0 then len + i else if i > len then i - len else i
-
-nth n list =
-  if n == 0
-     then List.head list
-     else nth (n - 1) list
-
+view : Signal.Address (Action var result) -> Model var result -> Html
 view self model =
-  let selectedIndex = case model.selectedIndex of
-        Nothing -> -1
-        Just i -> i
-      
-      keyCodeToAction code =
-        case code of
-          9  ->                     -- Tab
-            if model.shift then Ok SelectPreviousMatch else Ok SelectNextMatch
-          40 -> Ok SelectNextMatch     -- Down Arrow
-          38 -> Ok SelectPreviousMatch -- Up Arrow
-          13 ->
-            case model.selectedIndex of
-              Nothing -> Ok SendRequest
-              Just i -> 
-                case nth i model.matches of
-                  Nothing -> Err "selection is invalid"
-                  Just m -> Ok (UseSelected m)
-          _ -> Err "not handling that key"
+  let
+    wrapper = div 
   in
-    div
-      []
-      [ viewHistory model.history
-      , replInput self model.input keyCodeToAction
-      , viewMatches selectedIndex model.matches
-      ]
+    div [ style [ ("position", "absolute")
+                , ("height", "100%")
+                , ("width", "100%")
+                , ("display", "flex")
+                , ("flex-direction", "column")
+                ]
+        ]
+        [
+          replInput self model (keyCodeToAction model)
+        , viewMatches model.highlightedMatch model.matches
+        , viewHistory model.resultHtml model.history
+        ]
 
-viewHistory log =
-  ul [] (List.map (\it -> li [] [ text it.input ]) log)
 
-replInput self val keyCodeToAction =
+replInput self model keyCodeToAction =
   let
       actionKeys = customDecoder keyCode keyCodeToAction
       dropEvent = { stopPropagation = True, preventDefault = True }
   in
     input [ type' "text"
-          , value val
-          , on "input" targetValue (\str -> Signal.message self (NewInput str))
+          , value (getCurrentInput model)
+          , on "input" targetValue (NewInput >> Signal.message self)
           , onWithOptions "keydown" dropEvent actionKeys (Signal.message self)
           , onWithOptions "keyup" dropEvent actionKeys (\_ -> Signal.message self DoNothing)
-          , Html.Attributes.style [("width", "100%"), ("font-size", "20px")]
+          , style [Styles.fullWidth, Styles.bigText]
           ]
           []
 
-dropKeydown self code = Signal.message self DoNothing
 
-viewMatches selectedIndex matches =
-  div [] (List.indexedMap (\i m -> viewMatch m (i == selectedIndex)) matches)
+viewMatches highlighted matches =
+  div [ style [ ("max-height", "50%")
+              , ("overflow-y", "scroll") ] ]
+      (List.map (\m -> viewMatch m highlighted) matches)
 
-viewMatch match isSelected =
+
+viewMatch match highlighted =
   let
     spans = List.map viewMatchPart match.matched
-    styles = [("padding", "5px")] ++ if isSelected then [("background-color", "#fafada")] else []
+    styles = Styles.padding5 :: if highlighted == (Just match) then [Styles.selected] else []
   in
-     div [ Html.Attributes.style styles ] spans
+     div [ style styles ] spans
 
+
+viewMatchPart : (Matcher.MatchPart var) -> Html
 viewMatchPart part =
   case part of
     Static s -> span [] [ text s ]
-    Variable _ s -> span [ Html.Attributes.style [("color", "green")] ] [ text s ]
+    Variable s _ -> span [ Html.Attributes.style [("color", "green")] ] [ text s ]
 
-app =
-    StartApp.start
-      { init = (emptyModel, Effects.none)
-      , update = update
-      , view = view
-      , inputs = [ Signal.map ShiftState Keyboard.shift
-                 , Signal.map MetaState Keyboard.meta
-                 ]
-      }
 
-main = app.html
+viewHistory : (result -> Html) -> Array (Execution var result) -> Html
+viewHistory resultHtml log =
+  let
+    scrollTop = Debug.watch "scrollTop" (1000000 * (Array.length log))
+  in
+  div [ Html.Attributes.property "scrollTop" (Json.Encode.int scrollTop)
+      , style [ ("flex", "1 1"), ("overflow-y", "scroll") ]
+      ]
+      ( log
+        |> Array.indexedMap (viewExecution resultHtml)
+        |> Array.toList
+        |> List.reverse
+      )
+
+
+viewExecution : (result -> Html) -> Int -> Execution var result -> Html
+viewExecution resultHtml i item =
+  let
+      (input, result) = case item of
+        Pending input _ -> (input, pre [] [ text "<pending>" ])
+        Completed input _ res -> (input, (resultHtml res))
+  in
+  div [ style [ Styles.padding5, Styles.topBorder ] ] [
+    div [ style [ Styles.padding5 ] ] [ text ("In[" ++ (toString i) ++ "]: " ++ input) ],
+    div [ style [ Styles.padding5 ] ] [ text ("Out[" ++ (toString i) ++ "]: "), result ]
+  ]
+
+
+---- HELPERS ----
+
+getExecInput e =
+  case e of
+    Pending input _ -> input
+    Completed input _ _ -> input
+
+
+getCurrentInput model =
+  Array.get model.historyPosition model.history
+  |> Maybe.map getExecInput
+  |> Maybe.withDefault model.input
+
+keyCodeToAction model code =
+  case code of
+    9  -> -- Tab
+      if model.shiftKey then Ok (MoveHighlight Up) else Ok (MoveHighlight Down)
+    40 -> -- Down Arrow
+      Ok (MoveHistory Up)
+    38 -> -- Up Arrow
+      Ok (MoveHistory Down)
+    13 -> -- Return
+      case model.highlightedMatch of
+        Nothing -> Ok Execute
+        Just m -> Ok (SelectMatch m)
+    _ -> Err "not handling that key"

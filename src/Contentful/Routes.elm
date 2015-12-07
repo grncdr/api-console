@@ -1,23 +1,59 @@
-module Contentful.Routes (deliveryAPI) where
+module Contentful.Routes (MatcherParams, Var(..), deliveryAPI) where
 
+import Dict exposing (Dict)
 import Matcher exposing (..)
 import Contentful.Data exposing (..)
 import String
 
+
+type alias SpaceContext = {
+  space: Space,
+  contentTypes: List ContentType,
+  apiKey: ApiKey
+}
+
+type alias MatcherParams = Dict String SpaceContext
+
+-- Variable values we can parse from the URL
+type Var = SpaceContextV SpaceContext
+         | ContentTypeV ContentType
+         | StringV String String -- Plain string variables have a name and value
+
 pathVariable name = chain [ static "/", delimitedVariable "/" name ]
 
-deliveryAPI : List ContentType -> Matcher
-deliveryAPI contentTypes =
-  chain [ static "GET /spaces"
-        , pathVariable "space"
+spaceChoices spaces =
+  Dict.toList spaces |> List.map (\(id, ctx) -> (id, SpaceContextV ctx))
+
+first : (a -> Maybe b) -> List a -> Maybe b
+first f list =
+  List.head (List.filterMap f list)
+
+spaceContext =
+  matchBindings >> first (\var ->
+    case var of
+      SpaceContextV ctx -> Just ctx
+      _ -> Nothing
+  )
+
+contentTypeContext =
+  matchBindings >> first (\var ->
+    case var of
+      ContentTypeV ct -> Just ct
+      _ -> Nothing
+  )
+
+deliveryAPI : MatcherParams -> Matcher Var
+deliveryAPI spaces =
+  chain [ static "GET /spaces/"
+        , choiceVariable (spaceChoices spaces)
         , oneOf [ chain [ static "/entries"
-                        , oneOf [ pathVariable "entry", entryQueryParameters contentTypes]
+                        , oneOf [ pathVariable (StringV "entry"), entryQueryParameters_ ]
                         ]
                 , chain [ static "/assets"
-                        , oneOf [ pathVariable "asset", assetQueryParameters ]
+                        , oneOf [ pathVariable (StringV "asset"), assetQueryParameters ]
                         ]
                 , chain [ static "/content_types"
-                        , oneOf [ pathVariable "contentType", contentTypeQueryParameters ]
+                        , oneOf [ pathVariable (StringV "contentType"), contentTypeQueryParameters ]
                         ]
                 ]
         ]
@@ -37,31 +73,34 @@ contentTypeQueryParameters = queryParameters commonQueryParameters
 
 assetQueryParameters =
   queryParameters
-    (commonQueryParameters ++ [ fieldParameters { id = "title", type' = Text }
-                              , fieldParameters { id = "description", type' = Text }
+    (commonQueryParameters ++ [ fieldQueryParameters { id = "title", type' = Text }
+                              , fieldQueryParameters { id = "description", type' = Text }
                               ]
     )
+
+entryQueryParameters_ : Matcher Var
+entryQueryParameters_ match =
+  let
+    contentTypes = spaceContext match |> Maybe.map .contentTypes |> Maybe.withDefault []
+  in
+    queryParameters (dynamicEntryQueryParameter contentTypes :: commonQueryParameters) match
 
 entryQueryParameters contentTypes =
   queryParameters (dynamicEntryQueryParameter contentTypes :: commonQueryParameters)
 
+dynamicEntryQueryParameter : List ContentType -> Matcher Var
 dynamicEntryQueryParameter contentTypes match =
   let
-      contentTypeId =
-        List.head << List.filter (\(name, v) -> name == "content_type") <| matchBindings match
-      contentType = case contentTypeId of
-        Nothing -> Nothing
-        Just (_, id) -> List.head << List.filter (\ct -> ct.id == id) <| contentTypes
-      extraParams = case contentType of
-        Nothing -> [contentTypeParameter contentTypes]
-        Just ct -> List.map fieldParameters ct.fields
+    matchers = case contentTypeContext match of
+      Nothing -> [contentTypeQueryParameter contentTypes]
+      Just ct -> [] --List.map fieldQueryParameters ct.fields
   in
-     oneOf extraParams match
+    oneOf matchers match
 
-contentTypeParameter contentTypes =
-  chain [ static "content_type"
-        , static "="
-        , choiceVariable (List.map .id contentTypes) "content_type"
+contentTypeQueryParameter : List ContentType -> Matcher Var
+contentTypeQueryParameter contentTypes =
+  chain [ static "content_type="
+        , choiceVariable (List.map (\ct -> (ct.id, ContentTypeV ct)) contentTypes)
         ]
 
 unique items =
@@ -71,9 +110,9 @@ unique items =
     items
 
 simpleQueryParameter name =
-  chain [ static name, static "=", delimitedVariable "&" name ]
+  chain [ static name, static "=", delimitedVariable "&" (StringV name) ]
 
-typedQueryParameters : List String -> FieldType -> Matcher
+typedQueryParameters : List String -> FieldType -> Matcher Var
 typedQueryParameters path type' =
   let
       nameMatchers = List.map static path
@@ -81,12 +120,12 @@ typedQueryParameters path type' =
   in
      chain
      (nameMatchers ++ [ opMatcher
-                      , delimitedVariable "&" (String.join "" path)
+                      , delimitedVariable "&" (StringV (String.join "" path))
                       ])
  
 
-fieldParameters : Field -> Matcher
-fieldParameters field =
+fieldQueryParameters : Field -> Matcher Var
+fieldQueryParameters field =
   typedQueryParameters ["fields.", field.id] field.type'
 
 validOperators type' =

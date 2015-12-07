@@ -1,4 +1,9 @@
-module Contentful.Data (ContentType, Field, FieldType(..)) where 
+module Contentful.Data (Space, ApiKey, ContentType, Field, FieldType(..)) where 
+
+type alias Space = {
+  id: String,
+  name: String
+}
 
 {-|
 This module implements just enough of the ContentType data model to power
@@ -24,3 +29,5 @@ type alias ContentType =
   { id: String
   , fields: List Field
   }
+
+type alias ApiKey = { id: String, name: String, token: String }
